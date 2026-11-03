@@ -1,0 +1,7 @@
+# files NOT uploaded by "gcloud run deploy --source ."
+.gcloudignore
+.env
+*.db
+**/__pycache__/
+**/.pytest_cache/
+*.tar.gz

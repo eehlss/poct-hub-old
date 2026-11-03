@@ -1,0 +1,8 @@
+.env
+*.db
+**/__pycache__
+**/.pytest_cache
+*.tar.gz
+tests/
+requirements-dev.txt
+DEPLOY-CLOUDRUN.md
