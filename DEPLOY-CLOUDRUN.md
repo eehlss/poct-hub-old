@@ -103,7 +103,8 @@ curl -s -u demo https://poct-hub-250296213348.europe-west1.run.app/api/ai/ping
 ```
 1. `/health` should show `"ai_mode":"meta"` and `"key_configured":true`. This only proves the key is **present**.
 2. `/api/ai/ping` makes one tiny live call to check the key **works**. curl prompts for the dashboard password.
-   - `{"ok":true,...}` means real reads are on.
+   - `{"ok":true,"reply_chars":2,"finish_reason":"stop",...}` means real reads are on. The ping never returns the reply text.
+   - `"ok":false` with `"reply_chars":0` and `"finish_reason":"length"` means the model used the whole token budget on reasoning (Muse Spark always reasons, and reasoning tokens count against `max_completion_tokens`). The kit uses 2048 tokens with `minimal` effort for the ping, 4096 with `low` effort for photo reads, and 2048 for messages. `reasoning_tokens` shows how much was used.
    - `"error":"http_401"` means the key is wrong. Add a new secret version and redeploy.
    - `http_403` or `http_429` points to access or rate limits on the Meta account.
 3. Meta's public status endpoint (no key needed): `curl -s https://api.meta.ai/v1/status`.

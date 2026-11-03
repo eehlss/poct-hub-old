@@ -6,7 +6,7 @@ Target: Meta Model API (verified against https://dev.meta.ai/docs on 4 Nov 2026)
   POST /chat/completions, model muse-spark-1.3 (text + image input), image as an image_url
   data URL (jpeg/png/gif/webp only, not SVG), structured output via response_format json_schema.
 Env: META_API_BASE, META_API_KEY (secret; never logged), META_VISION_MODEL, META_TEXT_MODEL,
-     META_CHAT_PATH (/chat/completions), META_TIMEOUT_S (30), META_REASONING_EFFORT (low).
+     META_CHAT_PATH (/chat/completions), META_TIMEOUT_S (60), META_REASONING_EFFORT (low).
 The AI never grades: gates.py does. Drafts are number-checked and always need clinician approval.
 """
 from __future__ import annotations
@@ -25,7 +25,7 @@ def _cfg():
         "text": os.getenv("META_TEXT_MODEL", "muse-spark-1.3"),
         "effort": os.getenv("META_REASONING_EFFORT", "low").strip(),
         "path": os.getenv("META_CHAT_PATH", "/chat/completions"),
-        "timeout": float(os.getenv("META_TIMEOUT_S", "30")),
+        "timeout": float(os.getenv("META_TIMEOUT_S", "60")),
     }
 
 
@@ -67,18 +67,38 @@ class MetaAPIError(Exception):
     """Carries only the HTTP status, never headers or the key."""
 
 
+# Muse Spark always reasons, and reasoning tokens count against max_completion_tokens.
+# Too small a budget gives finish_reason "length" with empty content (https://dev.meta.ai/docs/reasoning).
+MAX_TOKENS = {"ping": 2048, "vision": 4096, "draft": 2048}
+EFFORT_PING = "minimal"
+
+
 def _content_text(content) -> str:
-    if isinstance(content, list):  # tolerate content-part arrays
-        return "".join(p.get("text", "") for p in content if isinstance(p, dict))
-    return content or ""
+    """content may be a string, null, or a list of parts ({"type":"text","text":...} or plain strings)."""
+    if isinstance(content, list):
+        out = []
+        for p in content:
+            if isinstance(p, str):
+                out.append(p)
+            elif isinstance(p, dict):
+                t = p.get("text")
+                if isinstance(t, dict):          # {"text": {"value": ...}} variant
+                    t = t.get("value")
+                if isinstance(t, str):
+                    out.append(t)
+        return "".join(out)
+    return content if isinstance(content, str) else ""
 
 
-def _chat(model: str, messages: list, schema: dict | None = None, max_tokens: int = 800) -> str:
+def _chat_full(model: str, messages: list, schema: dict | None = None, max_tokens: int = 4096,
+               effort: str | None = None) -> dict:
+    """One Chat Completions call. Returns {text, finish_reason, completion_tokens, reasoning_tokens}."""
     c = _cfg()
     # Muse Spark docs: leave temperature/top_p at defaults; reasoning_effort "none" is rejected.
     body = {"model": model, "messages": messages, "max_completion_tokens": max_tokens}
-    if c["effort"]:
-        body["reasoning_effort"] = c["effort"]
+    eff = effort if effort is not None else c["effort"]
+    if eff:
+        body["reasoning_effort"] = eff
     if schema:
         body["response_format"] = {"type": "json_schema", "json_schema": {"name": "reading", "schema": schema}}
     try:
@@ -90,18 +110,43 @@ def _chat(model: str, messages: list, schema: dict | None = None, max_tokens: in
     if r.status_code >= 400:
         log.warning("meta api HTTP %s for model %s", r.status_code, model)
         raise MetaAPIError(f"http_{r.status_code}")
-    return _content_text(r.json()["choices"][0]["message"].get("content"))
+    d = r.json()
+    ch = (d.get("choices") or [{}])[0]
+    msg = ch.get("message") or {}
+    usage = d.get("usage") or {}
+    details = usage.get("completion_tokens_details") or {}
+    out = {"text": _content_text(msg.get("content")), "finish_reason": ch.get("finish_reason"),
+           "completion_tokens": usage.get("completion_tokens"), "reasoning_tokens": details.get("reasoning_tokens")}
+    if not out["text"].strip():
+        log.warning("meta api empty content (finish_reason=%s, reasoning_tokens=%s, max=%s)",
+                    out["finish_reason"], out["reasoning_tokens"], max_tokens)
+    return out
+
+
+def _chat(model: str, messages: list, schema: dict | None = None, max_tokens: int = 4096,
+          effort: str | None = None) -> str:
+    """Text of the reply. Raises MetaAPIError('empty_<finish_reason>') when the model returned no text."""
+    r = _chat_full(model, messages, schema, max_tokens, effort)
+    if not r["text"].strip():
+        raise MetaAPIError(f"empty_{r['finish_reason'] or 'reply'}")
+    return r["text"]
 
 
 def ping() -> dict:
-    """Tiny live call used by /api/ai/ping (auth-protected). Returns status only."""
+    """Tiny live call used by /api/ai/ping (auth-protected). Returns status only, never the reply text or key."""
     if mode() != "meta":
         return {"ai_mode": "stub", "ok": None}
+    model = _cfg()["text"]
     try:
-        out = _chat(_cfg()["text"], [{"role": "user", "content": "Reply with the single word OK."}], max_tokens=200)
-        return {"ai_mode": "meta", "ok": True, "model": _cfg()["text"], "reply_chars": len(out)}
+        r = _chat_full(model, [{"role": "user", "content": "Reply with the single word OK."}],
+                       max_tokens=MAX_TOKENS["ping"], effort=EFFORT_PING)
+        return {"ai_mode": "meta", "ok": bool(r["text"].strip()), "model": model, "reply_chars": len(r["text"]),
+                "finish_reason": r["finish_reason"], "completion_tokens": r["completion_tokens"],
+                "reasoning_tokens": r["reasoning_tokens"], "max_completion_tokens": MAX_TOKENS["ping"],
+                "reasoning_effort": EFFORT_PING}
     except Exception as e:
-        return {"ai_mode": "meta", "ok": False, "error": str(e) if isinstance(e, MetaAPIError) else type(e).__name__}
+        return {"ai_mode": "meta", "ok": False, "model": model,
+                "error": str(e) if isinstance(e, MetaAPIError) else type(e).__name__}
 
 
 # ---------- extraction ----------
@@ -136,14 +181,15 @@ def extract_reading(image: bytes, content_type: str = "") -> dict:
             img_part = {"type": "image_url", "image_url": {"url": f"data:{ct};base64,{b64}"}}
             try:
                 out = _chat(_cfg()["vision"], [{"role": "user", "content": [
-                    {"type": "text", "text": prompt}, img_part]}], schema=READING_SCHEMA)
+                    {"type": "text", "text": prompt}, img_part]}], schema=READING_SCHEMA,
+                    max_tokens=MAX_TOKENS["vision"])
             except MetaAPIError as e:
                 if str(e) != "http_400":
                     raise
                 # schema rejected (nullable unions are UNVERIFIED on Model API): ask for JSON in the prompt instead
                 out = _chat(_cfg()["vision"], [{"role": "user", "content": [
                     {"type": "text", "text": prompt + " Reply with JSON only: " + json.dumps(READING_SCHEMA["properties"])},
-                    img_part]}])
+                    img_part]}], max_tokens=MAX_TOKENS["vision"])
             d = json.loads(out[out.find("{"): out.rfind("}") + 1])
             v = d.get("value")
             return {"legible": bool(d.get("legible")) and isinstance(v, (int, float)),
@@ -185,11 +231,11 @@ def draft_message(ctx: dict) -> dict:
     if mode() == "meta" and ctx["grade"] != "critical":   # critical path never goes through the model
         try:
             out = _chat(_cfg()["text"], [
-                {"role": "system", "content": "Rewrite the clinic message in plain, kind language (max 60 words). "
+                {"role": "developer", "content": "Rewrite the clinic message in plain, kind language (max 60 words). "
                  "Do not add numbers, doses, diagnoses or advice not in the input."},
-                {"role": "user", "content": base}], max_tokens=600)
+                {"role": "user", "content": base}], max_tokens=MAX_TOKENS["draft"])
             chk = number_check(ctx, out)
-            if chk["ok"]:
+            if out.strip() and chk["ok"]:
                 text, source = out.strip(), "meta"
         except Exception:
             pass
