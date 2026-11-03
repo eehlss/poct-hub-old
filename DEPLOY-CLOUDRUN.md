@@ -5,10 +5,11 @@
 **What gets deployed**
 - One container: FastAPI + SQLite. The database file is `/tmp/poct_hub.db`. It is created and seeded with synthetic data on every start.
 - Cloud Run provides HTTPS.
-- Basic auth (`DASHBOARD_USER` / `DASHBOARD_PASSWORD`) protects every page except `/healthz` and `/webhook/*`.
+- Basic auth (`DASHBOARD_USER` / `DASHBOARD_PASSWORD`) protects every page except `/health` (alias `/healthz`) and `/webhook/*`.
+  - Use `/health` on `*.run.app`: Google's front end reserves `/healthz` there, so it never reaches the app.
   - The webhook checks an HMAC signature, and it returns 503 unless `WHATSAPP_APP_SECRET` is set.
   - If no password is configured, the app fails closed: every protected page returns 401.
-- Meta model API: optional. Without `META_API_KEY` the app runs in deterministic **stub** mode. The endpoint, model IDs and payload are **UNVERIFIED**; configure them from the official hackathon docs.
+- Meta Model API: optional. Without `META_API_KEY` the app runs in deterministic **stub** mode. Settings verified against https://dev.meta.ai/docs on 4 Nov 2026: base `https://api.meta.ai/v1`, `Authorization: Bearer <key>`, `POST /chat/completions`, model `muse-spark-1.3` (text and image input). See section 4b.
 
 All commands below are for **Windows Command Prompt (cmd.exe)**, typed interactively. `^` continues a line.
 
@@ -69,30 +70,57 @@ gcloud run deploy poct-hub --source . --region %REGION% ^
 
 **Data resets:** the data goes back to the synthetic seed on every **cold start**. Cold starts happen when the service scales to zero after it has been idle, and on every new revision. That is fine for a demo. `--min-instances 1` would keep the data longer, but it costs money because it is outside the free tier.
 
-### Optional: real Meta model API (UNVERIFIED settings)
+## 4b. Add the Meta key (real AI reads instead of the stub)
+**Get a key:** sign in at https://dev.meta.ai, open the Model API dashboard, then **API keys → Create API key**. The key starts with `LLM_` and is shown **only once**. Source: https://dev.meta.ai/docs/authentication.
+
+**Cost:** `muse-spark-1.3` costs $1.25 per 1M input tokens and $4.25 per 1M output tokens (https://dev.meta.ai/docs/pricing-rate-limits). A demo uses cents. Do **not** use `muse-spark-1.3-contributor`: Meta may train on content sent to that model.
+
+**Data:** photos and message context go to Meta's API. Send only the synthetic demo meter, never a real patient photo.
+
+In Notepad, paste the key **without pressing Enter**, save, and close. Then run:
 ```bat
 notepad %TEMP%\meta-key.txt
-gcloud secrets create poct-meta-api-key --replication-policy=automatic --data-file=%TEMP%\meta-key.txt
+gcloud secrets create meta-api-key --replication-policy=automatic --data-file=%TEMP%\meta-key.txt
 del %TEMP%\meta-key.txt
-gcloud secrets add-iam-policy-binding poct-meta-api-key ^
+
+gcloud secrets add-iam-policy-binding meta-api-key ^
   --member=serviceAccount:%PROJECT_NUMBER%-compute@developer.gserviceaccount.com ^
   --role=roles/secretmanager.secretAccessor
-
-gcloud run services update poct-hub --region %REGION% ^
-  --update-env-vars META_API_BASE=https://CONFIGURE_FROM_DOCS,META_VISION_MODEL=CONFIGURE_ME,META_TEXT_MODEL=CONFIGURE_ME,META_CHAT_PATH=/chat/completions ^
-  --update-secrets META_API_KEY=poct-meta-api-key:latest
 ```
-To go back to stub mode, run `gcloud run services update poct-hub --region %REGION% --remove-secrets META_API_KEY`.
+To replace the key later, run `gcloud secrets versions add meta-api-key --data-file=%TEMP%\meta-key.txt`, then redeploy.
+
+Redeploy with the Meta settings. `--set-env-vars` **replaces all** environment variables, so the dashboard values are repeated here:
+```bat
+gcloud run deploy poct-hub --source . --region %REGION% ^
+  --allow-unauthenticated --min-instances 0 --max-instances 1 --memory 512Mi --cpu 1 ^
+  --set-env-vars DASHBOARD_USER=demo,SEED_ON_START=true,META_API_BASE=https://api.meta.ai/v1,META_VISION_MODEL=muse-spark-1.3,META_TEXT_MODEL=muse-spark-1.3 ^
+  --set-secrets DASHBOARD_PASSWORD=poct-dashboard-password:latest,META_API_KEY=meta-api-key:latest
+```
+Check the result:
+```bat
+curl -s https://poct-hub-250296213348.europe-west1.run.app/health
+curl -s -u demo https://poct-hub-250296213348.europe-west1.run.app/api/ai/ping
+```
+1. `/health` should show `"ai_mode":"meta"` and `"key_configured":true`. This only proves the key is **present**.
+2. `/api/ai/ping` makes one tiny live call to check the key **works**. curl prompts for the dashboard password.
+   - `{"ok":true,...}` means real reads are on.
+   - `"error":"http_401"` means the key is wrong. Add a new secret version and redeploy.
+   - `http_403` or `http_429` points to access or rate limits on the Meta account.
+3. Meta's public status endpoint (no key needed): `curl -s https://api.meta.ai/v1/status`.
+
+If the API fails, the app fails closed: the photo is treated as unreadable and the submission falls back to the typed value. Messages fall back to fixed templates. Critical results never go to the model.
+
+**Back to stub mode:** `gcloud run services update poct-hub --region %REGION% --remove-secrets META_API_KEY`.
 
 ## 5. Verify
 ```bat
 gcloud run services describe poct-hub --region %REGION% --format="value(status.url)"
 set URL=PASTE_THE_URL_PRINTED_ABOVE
-curl -s %URL%/healthz
+curl -s %URL%/health
 curl -s -o NUL -w "%{http_code}\n" %URL%/
 curl -s -u demo %URL%/api/lots
 ```
-1. `/healthz` should return `{"status":"ok","db":"ok","ai_mode":"stub",...}`.
+1. `/health` should return `{"status":"ok","db":"ok","ai_mode":"stub",...}`, or `"meta"` after section 4b.
 2. `/` without credentials should return **401**.
 3. In the third command, curl prompts for the password without echoing it. The output should show `LOT-G-2611B` as `"hold"`.
 
@@ -128,7 +156,7 @@ gcloud beta run domain-mappings describe --domain poct.wacp.dev --region %REGION
 ```bat
 nslookup poct.wacp.dev 1.1.1.1
 gcloud beta run domain-mappings describe --domain poct.wacp.dev --region %REGION% --format="value(status.conditions)"
-curl -s https://poct.wacp.dev/healthz
+curl -s https://poct.wacp.dev/health
 ```
 **Fallback:** if verification or the certificate stalls, give the judges the `https://poct-hub-....run.app` URL. It has HTTPS from the start and needs no DNS.
 

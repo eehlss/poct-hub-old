@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response, PlainTextResponse
-from . import db, gates, lots as lotmod, westgard, ai_hook
+from . import db, gates, lots as lotmod, westgard, ai_hook, meter_png
 
 VERSION = "0.1.0"
 BANNER = "RESEARCH AND DECISION-SUPPORT ONLY. Not a medical device. Synthetic data only. Clinician review required."
@@ -26,7 +26,7 @@ async def lifespan(_app):
 
 app = FastAPI(title="POCT Hub MVP", version=VERSION, description=BANNER, lifespan=lifespan)
 
-OPEN_PATHS = ("/healthz",)
+OPEN_PATHS = ("/healthz", "/health")  # Google reserves /healthz on *.run.app; /health is the public alias
 OPEN_PREFIXES = ("/webhook/",)   # HMAC-verified; disabled (503) unless WHATSAPP_APP_SECRET is set
 
 
@@ -130,6 +130,7 @@ def qc_status():
 
 
 # ---------------- API ----------------
+@app.get("/health")
 @app.get("/healthz")
 def healthz():
     try:
@@ -138,7 +139,7 @@ def healthz():
     except Exception as e:
         dbs = f"error:{type(e).__name__}"
     return {"status": "ok" if dbs == "ok" else "degraded", "db": dbs, "ai_mode": ai_hook.mode(),
-            "version": VERSION, "label": "research and decision-support only"}
+            "ai": ai_hook.public_config(), "version": VERSION, "label": "research and decision-support only"}
 
 
 @app.post("/api/submit")
@@ -192,6 +193,18 @@ def api_messages(client_id: str):
 def api_approve(mid: int):
     db.ex("UPDATE messages SET status='sent' WHERE id=:i AND status='draft'", i=mid)
     return db.one("SELECT * FROM messages WHERE id=:i", i=mid)
+
+
+@app.get("/api/ai/ping")
+def api_ai_ping():
+    """Auth-protected live check of the Meta key (one tiny text call). Never returns the key."""
+    return ai_hook.ping()
+
+
+@app.get("/demo/meter.png")
+def demo_meter_png(value: float = 7.8, unit: str = "mmol/L", error: str = ""):
+    """PNG version of the synthetic meter (Meta Model API accepts PNG/JPEG/GIF/WebP, not SVG)."""
+    return Response(meter_png.render(value, unit, error), media_type="image/png")
 
 
 @app.get("/demo/meter.svg")
@@ -258,7 +271,7 @@ def page(title, body):
     return HTMLResponse(f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title} · POCT Hub</title><style>{CSS}</style></head><body>
 <div class="banner" role="alert">{BANNER}</div>
-<nav><a href="/">Clinic dashboard</a><a href="/simulator">WhatsApp simulator</a><a href="/docs">API</a><a href="/healthz">/healthz</a></nav>
+<nav><a href="/">Clinic dashboard</a><a href="/simulator">WhatsApp simulator</a><a href="/docs">API</a><a href="/health">/health</a></nav>
 <main>{body}</main></body></html>""")
 
 
