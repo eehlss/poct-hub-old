@@ -295,9 +295,9 @@ The 22 tests cover:
 
 ---
 
-## 10. Licence
+## 10. License
 
-**TBD: the licence has not yet been chosen** (for example MIT or Apache-2.0). Until a licence is added, all rights are reserved by the author.
+This project is licensed under the Apache License, Version 2.0. See the [LICENSE](LICENSE) file for details.
 
 ---
 
